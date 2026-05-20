@@ -17,18 +17,40 @@ const statusArg = (process.argv[2] || "fechado").toLowerCase();
 const onceMode = process.argv.includes("--once");
 const status = statusArg === "aberto" ? "aberto" : "fechado";
 const listenMode = process.argv.includes("--listen");
+const commandMode = process.argv.includes("--cmd");
 const subArgIndex = process.argv.indexOf("--sub");
 const responseTopic =
   subArgIndex >= 0 && process.argv[subArgIndex + 1]
     ? process.argv[subArgIndex + 1]
     : "portsafe/locker/ack";
+const lockerIdArg = process.argv.find((arg) => arg.startsWith("--locker-id="));
+const parsedLockerId = lockerIdArg ? Number(lockerIdArg.split("=")[1]) : NaN;
+const lockerId =
+  Number.isInteger(parsedLockerId) && parsedLockerId > 0 ? parsedLockerId : 1;
+const topicArg = process.argv.find((arg) => arg.startsWith("--topic="));
+const publishTopic = topicArg ? topicArg.split("=")[1] : "portsafe/locker";
+const cmdTopicArg = process.argv.find((arg) => arg.startsWith("--cmd-topic="));
+const commandTopic = cmdTopicArg
+  ? cmdTopicArg.split("=")[1]
+  : `portsafe/locker/${lockerId}/cmd`;
 const waitArg = process.argv.find((arg) => arg.startsWith("--wait-ms="));
 const waitMs = waitArg ? Number(waitArg.split("=")[1]) : 5000;
 const onceWaitMs = Number.isFinite(waitMs) && waitMs > 0 ? waitMs : 5000;
+const clientIdArg = process.argv.find((arg) => arg.startsWith("--client-id="));
+const clientId = clientIdArg
+  ? clientIdArg.split("=")[1]
+  : `esp32-simulado-${Date.now()}`;
 
 console.log("🧪 Modo:", onceMode ? "envio unico" : "envio continuo");
 console.log("📦 Status enviado:", status);
+console.log("🗄️ LockerId:", lockerId);
+console.log("🆔 ClientId:", clientId);
 console.log("👂 Topico de resposta:", responseTopic);
+console.log("📤 Topico de envio:", publishTopic);
+console.log("🎛️ Escuta de comandos:", commandMode ? "ligada" : "desligada");
+if (commandMode) {
+  console.log("🧭 Topico de comandos:", commandTopic);
+}
 console.log(
   "📨 Escuta do topico de envio:",
   listenMode ? "ligada" : "desligada",
@@ -38,7 +60,7 @@ const device = awsIot.device({
   keyPath: keyPath,
   certPath: certPath,
   caPath: caPath,
-  clientId: "esp32-simulado",
+  clientId: clientId,
   host: "a1j1qwd3dpi3ec-ats.iot.us-east-1.amazonaws.com",
   protocol: "mqtts",
   reconnectPeriod: 5000,
@@ -50,15 +72,37 @@ console.log("⏳ Tentando conectar ao AWS IoT...");
 
 let connected = false;
 let publishTimer = null;
+let currentStatus = status;
+
+function normalizeStatus(input) {
+  if (input === "aberto" || input === "open") return "aberto";
+  if (input === "fechado" || input === "closed") return "fechado";
+  return null;
+}
+
+function applyCommand(message) {
+  const cmd = (message || "").toString().trim().toLowerCase();
+
+  if (cmd === "toggle") {
+    currentStatus = currentStatus === "aberto" ? "fechado" : "aberto";
+    return true;
+  }
+
+  const normalized = normalizeStatus(cmd);
+  if (!normalized) return false;
+
+  currentStatus = normalized;
+  return true;
+}
 
 function publishMessage() {
   const msg = {
-    lockerId: 1,
-    status,
-    timestamp: new Date(),
+    lockerId,
+    status: currentStatus,
+    timestamp: new Date().toISOString(),
   };
 
-  device.publish("portsafe/locker", JSON.stringify(msg));
+  device.publish(publishTopic, JSON.stringify(msg));
   console.log("📡 Enviado:", msg);
 }
 
@@ -92,12 +136,22 @@ device.on("connect", () => {
   });
 
   if (listenMode) {
-    device.subscribe("portsafe/locker", { qos: 0 }, (err) => {
+    device.subscribe(publishTopic, { qos: 0 }, (err) => {
       if (err) {
         console.log("⚠️ Falha ao assinar topico de envio:", err.message);
         return;
       }
-      console.log("✅ Assinando envio em: portsafe/locker");
+      console.log("✅ Assinando envio em:", publishTopic);
+    });
+  }
+
+  if (commandMode) {
+    device.subscribe(commandTopic, { qos: 0 }, (err) => {
+      if (err) {
+        console.log("⚠️ Falha ao assinar topico de comando:", err.message);
+        return;
+      }
+      console.log("✅ Assinando comando em:", commandTopic);
     });
   }
 
@@ -130,7 +184,7 @@ device.on("close", () => {
 });
 
 device.on("offline", () => {
-  console.log("📴 Dispositivo offline");
+  console.log("📴 Dispositivo offline (clientId:", clientId + ")");
 });
 
 device.on("reconnect", () => {
@@ -139,6 +193,39 @@ device.on("reconnect", () => {
 
 device.on("message", (topic, payload) => {
   const text = payload.toString();
+
+  if (commandMode && topic === commandTopic) {
+    let handled = false;
+
+    try {
+      const data = JSON.parse(text);
+      const targetLocker = Number(data.lockerId);
+
+      if (Number.isFinite(targetLocker) && targetLocker !== lockerId) {
+        console.log("⏭️ Comando ignorado: lockerId diferente", data.lockerId);
+        return;
+      }
+
+      handled = applyCommand(data.command || data.status || "");
+      if (handled) {
+        console.log("🎛️ Comando aplicado. Novo status:", currentStatus);
+        publishMessage();
+      } else {
+        console.log("⚠️ Comando invalido recebido:", data);
+      }
+      return;
+    } catch {
+      handled = applyCommand(text);
+      if (handled) {
+        console.log("🎛️ Comando aplicado. Novo status:", currentStatus);
+        publishMessage();
+      } else {
+        console.log("⚠️ Comando invalido recebido:", text);
+      }
+      return;
+    }
+  }
+
   try {
     console.log("📥 Recebido [" + topic + "]:", JSON.parse(text));
   } catch {
